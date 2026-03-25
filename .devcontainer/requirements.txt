@@ -1,0 +1,10 @@
+# Machine Learning framework
+torch
+torchvision
+
+# Image processing and augmentation
+opencv-python-headless
+albumentations
+
+# Data manipulation
+numpy
