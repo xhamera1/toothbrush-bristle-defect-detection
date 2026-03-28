@@ -91,7 +91,7 @@ def run_tests():
     print("-" * 70)
 
     defective_files = sorted([f for f in os.listdir(DEFECTIVE_IMG_DIR) if f.endswith('.png')])
-    test_defective = defective_files[:5]  # test first 5
+    test_defective = defective_files[:15]  # test first 15
 
     for img_name in test_defective:
         total_tests += 1
@@ -135,7 +135,7 @@ def run_tests():
     print("-" * 70)
 
     good_files = sorted([f for f in os.listdir(GOOD_IMG_DIR) if f.endswith('.png')])
-    test_good = good_files[:5]  # test first 5
+    test_good = good_files[:15]  # test first 15
 
     for img_name in test_good:
         total_tests += 1
