@@ -6,12 +6,25 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import segmentation_models_pytorch as smp
 
+# Resolve the directory of THIS script file, so weights.pth is always
+# found regardless of the current working directory (critical for CodaBench).
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+DEVICE = torch.device('cpu')
+
+
 class ToothbrushDefectDetector:
-    def __init__(self, weights_path='weights.pth', device=None):
+    def __init__(self, weights_path=None):
         """
         Initializes the hybrid detection system (OpenCV + U-Net).
+        
+        The weights_path is resolved relative to this file's directory
+        to ensure compatibility with the CodaBench Docker environment,
+        where the working directory may differ from the submission directory.
         """
-        self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if weights_path is None:
+            weights_path = os.path.join(SCRIPT_DIR, 'weights.pth')
         
         self.model = smp.Unet(
             encoder_name="resnet34",        
@@ -23,8 +36,8 @@ class ToothbrushDefectDetector:
         if not os.path.exists(weights_path):
             raise FileNotFoundError(f"Weights file not found at {weights_path}")
             
-        self.model.load_state_dict(torch.load(weights_path, map_location=self.device, weights_only=True))
-        self.model.to(self.device)
+        self.model.load_state_dict(torch.load(weights_path, map_location=DEVICE, weights_only=True))
+        self.model.to(DEVICE)
         self.model.eval()
         
         self.transform = A.Compose([
@@ -72,6 +85,12 @@ class ToothbrushDefectDetector:
         """
         Main pipeline: Executes classical CV for external defects, 
         and Deep Learning for internal defects on the ROI.
+        
+        Args:
+            image_rgb: numpy array of shape (H, W, 3), uint8 RGB image.
+            
+        Returns:
+            Binary mask as numpy array of shape (H, W), uint8 with values 0 or 255.
         """
         original_h, original_w = image_rgb.shape[:2]
         final_mask = np.zeros((original_h, original_w), dtype=np.uint8)
@@ -96,7 +115,7 @@ class ToothbrushDefectDetector:
             
             if crop_h > 10 and crop_w > 10:
                 augmented = self.transform(image=cropped_rgb)
-                input_tensor = augmented['image'].unsqueeze(0).to(self.device)
+                input_tensor = augmented['image'].unsqueeze(0).to(DEVICE)
                 
                 with torch.no_grad():
                     output = self.model(input_tensor)
@@ -113,9 +132,20 @@ class ToothbrushDefectDetector:
                 
         return final_mask
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-detector = ToothbrushDefectDetector(weights_path='weights.pth', device=device)
+# Module-level initialization: create the detector once when model.py is imported.
+# This is the pattern expected by CodaBench's scoring script.
+detector = ToothbrushDefectDetector()
+
 
 def predict(image):
+    """
+    Entry point called by the CodaBench scoring script.
+    
+    Args:
+        image: numpy array of shape (H, W, 3), uint8 RGB image.
+        
+    Returns:
+        Binary mask as numpy array of shape (H, W), uint8 with values 0 or 255.
+    """
     return detector.predict(image)
