@@ -14,6 +14,7 @@ import sys
 import cv2
 import numpy as np
 import time
+import matplotlib.pyplot as plt
 
 # -- Setup paths ---------------------------------------------------------------
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -64,6 +65,38 @@ def validate_output(result, original_shape):
     return errors
 
 
+def save_comparison_table(samples, output_path):
+    """Save a 3-column comparison table: original image, GT mask, prediction mask."""
+    if not samples:
+        print("  [INFO] No valid samples available for comparison table.")
+        return
+
+    rows = len(samples)
+    fig, axes = plt.subplots(rows, 3, figsize=(12, 4 * rows))
+
+    # Make axes indexing consistent for the single-row case.
+    if rows == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    for i, sample in enumerate(samples):
+        axes[i, 0].imshow(sample['image'])
+        axes[i, 0].set_title(f"Original\n{sample['name']}")
+        axes[i, 0].axis('off')
+
+        axes[i, 1].imshow(sample['gt_mask'], cmap='gray', vmin=0, vmax=255)
+        axes[i, 1].set_title("Ground Truth")
+        axes[i, 1].axis('off')
+
+        axes[i, 2].imshow(sample['pred_mask'], cmap='gray', vmin=0, vmax=255)
+        axes[i, 2].set_title(f"Prediction\nIoU={sample['iou']:.4f}")
+        axes[i, 2].axis('off')
+
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  [OK] Comparison table saved to: {output_path}")
+
+
 def run_tests():
     """Run all tests and print results."""
     print("=" * 70)
@@ -85,6 +118,7 @@ def run_tests():
     total_tests = 0
     passed_tests = 0
     ious = []
+    comparison_samples = []
 
     # -- Step 2: Test defective images (with ground truth) ---------------------
     print("\n[2/4] Testing DEFECTIVE images (with IoU evaluation)...")
@@ -126,6 +160,15 @@ def run_tests():
                 passed_tests += 1
                 print(f"  [OK]   {img_name} | IoU={iou_str} | "
                       f"defect={defect_pct:.2f}% | time={t_pred:.2f}s")
+
+                if gt_mask is not None and len(comparison_samples) < 3:
+                    comparison_samples.append({
+                        'name': img_name,
+                        'image': image_rgb,
+                        'gt_mask': gt_mask,
+                        'pred_mask': result,
+                        'iou': iou
+                    })
 
         except Exception as e:
             print(f"  [FAIL] {img_name} | EXCEPTION: {e}")
@@ -178,6 +221,11 @@ def run_tests():
             print(f"  [FAIL] {img_name} | EXCEPTION: {e}")
 
     # -- Step 4: Summary -------------------------------------------------------
+    print("\n[3.5/4] Saving comparison table for selected images...")
+    print("-" * 70)
+    comparison_path = os.path.join(PROJECT_ROOT, 'comparison_table.png')
+    save_comparison_table(comparison_samples, comparison_path)
+
     print(f"\n[4/4] SUMMARY")
     print("=" * 70)
     print(f"  Tests passed:   {passed_tests}/{total_tests}")

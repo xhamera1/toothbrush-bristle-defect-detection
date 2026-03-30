@@ -24,7 +24,7 @@ class ToothbrushDefectDetector:
         where the working directory may differ from the submission directory.
         """
         if weights_path is None:
-            weights_path = os.path.join(SCRIPT_DIR, 'weights.pth')
+            weights_path = os.path.join(SCRIPT_DIR, 'weights_v2.pth')
         
         self.model = smp.Unet(
             encoder_name="resnet34",        
@@ -47,26 +47,33 @@ class ToothbrushDefectDetector:
         ])
 
     def _get_body_mask(self, image_rgb):
-        """Extracts the base binary mask of the toothbrush using CLAHE and Otsu."""
         hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
-        h, s, v = cv2.split(hsv)
-        
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        v = hsv[:, :, 2]
+
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
         enhanced_v = clahe.apply(v)
-        blurred = cv2.GaussianBlur(enhanced_v, (5, 5), 0)
-        
+        blurred = cv2.GaussianBlur(enhanced_v, (3, 3), 0)
+
         otsu_thresh, _ = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        _, final_thresh = cv2.threshold(blurred, otsu_thresh * 0.5, 255, cv2.THRESH_BINARY)
-        
-        kernel = np.ones((21, 21), np.uint8)
-        closed_mask = cv2.morphologyEx(final_thresh, cv2.MORPH_CLOSE, kernel)
-        
-        contours, _ = cv2.findContours(closed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        filled_mask = np.zeros_like(closed_mask)
+        _, intensity_mask = cv2.threshold(blurred, int(otsu_thresh * 0.85), 255, cv2.THRESH_BINARY)
+
+        edges = cv2.Canny(blurred, threshold1=40, threshold2=120)
+        edge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        edges = cv2.dilate(edges, edge_kernel, iterations=1)
+
+        fused_mask = cv2.bitwise_or(intensity_mask, edges)
+
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        refined_mask = cv2.morphologyEx(fused_mask, cv2.MORPH_CLOSE, close_kernel)
+        refined_mask = cv2.morphologyEx(refined_mask, cv2.MORPH_OPEN, open_kernel)
+
+        contours, _ = cv2.findContours(refined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        filled_mask = np.zeros_like(refined_mask)
         if contours:
             largest_contour = max(contours, key=cv2.contourArea)
             cv2.drawContours(filled_mask, [largest_contour], -1, 255, -1)
-            
+
         return filled_mask
 
     def _get_external_defects(self, body_mask):
@@ -103,6 +110,7 @@ class ToothbrushDefectDetector:
         final_mask = cv2.bitwise_or(final_mask, external_defect_mask)
         final_mask = cv2.bitwise_or(final_mask, internal_dark_mask)
         
+        final_mask = cv2.dilate(body_mask,cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
         contours, _ = cv2.findContours(body_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         if contours:
@@ -123,7 +131,7 @@ class ToothbrushDefectDetector:
                 with torch.no_grad():
                     output = self.model(input_tensor)
                     prob = torch.sigmoid(output)
-                    pred = (prob > 0.5).float().cpu().numpy()[0, 0]
+                    pred = (prob > 0.16).float().cpu().numpy()[0, 0]
                 
                 pred_resized = cv2.resize(pred, (crop_w, crop_h), interpolation=cv2.INTER_NEAREST)
                 pred_binary = (pred_resized > 0).astype(np.uint8) * 255
@@ -131,7 +139,8 @@ class ToothbrushDefectDetector:
                 roi_mask = np.zeros((original_h, original_w), dtype=np.uint8)
                 roi_mask[y_start:y_end, x_start:x_end] = pred_binary
                 
-                final_mask = cv2.bitwise_or(final_mask, roi_mask)
+                final_mask = cv2.bitwise_and(final_mask, roi_mask)
+                # final_mask = cv2.bitwise_or(final_mask, roi_mask)
                 
         return final_mask
 
