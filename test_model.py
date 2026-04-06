@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 
 # -- Setup paths ---------------------------------------------------------------
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-SUBMISSION_DIR = os.path.join(PROJECT_ROOT, 'submission')
+SUBMISSION_DIR = os.path.join(PROJECT_ROOT, 'submission5')
 DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
 
 DEFECTIVE_IMG_DIR = os.path.join(DATA_DIR, 'train', 'defective')

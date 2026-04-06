@@ -13,9 +13,14 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DEVICE = torch.device('cpu')
 
+# Tunable threshold for U-Net predictions (will be optimized via grid search)
+UNET_THRESHOLD = 0.30
+
+ROI_TTA_SCALES = (0.92, 1.0)
+
 
 class ToothbrushDefectDetector:
-    def __init__(self, weights_path=None):
+    def __init__(self, weights_path=None, threshold=None, roi_tta_scales=None):
         """
         Initializes the hybrid detection system (OpenCV + U-Net).
         
@@ -24,8 +29,13 @@ class ToothbrushDefectDetector:
         where the working directory may differ from the submission directory.
         """
         if weights_path is None:
-            weights_path = os.path.join(SCRIPT_DIR, 'weights_v2.pth')
+            weights_path = os.path.join(SCRIPT_DIR, 'weights.pth')
         
+        self.threshold = threshold if threshold is not None else UNET_THRESHOLD
+        self.roi_tta_scales = (
+            tuple(roi_tta_scales) if roi_tta_scales is not None else ROI_TTA_SCALES
+        )
+
         self.model = smp.Unet(
             encoder_name="resnet34",        
             encoder_weights=None,
@@ -89,62 +99,6 @@ class ToothbrushDefectDetector:
         
         return cv2.morphologyEx(deviation_mask, cv2.MORPH_OPEN, noise_kernel)
 
-    def predict(self, image_rgb):
-        """
-        Main pipeline: Executes classical CV for external defects, 
-        and Deep Learning for internal defects on the ROI.
-        
-        Args:
-            image_rgb: numpy array of shape (H, W, 3), uint8 RGB image.
-            
-        Returns:
-            Binary mask as numpy array of shape (H, W), uint8 with values 0 or 255.
-        """
-        original_h, original_w = image_rgb.shape[:2]
-        final_mask = np.zeros((original_h, original_w), dtype=np.uint8)
-        
-        body_mask = self._get_body_mask(image_rgb)
-        external_defect_mask = self._get_external_defects(body_mask)
-        internal_dark_mask = self._get_internal_dark_defects(image_rgb, body_mask)
-        
-        final_mask = cv2.bitwise_or(final_mask, external_defect_mask)
-        final_mask = cv2.bitwise_or(final_mask, internal_dark_mask)
-        
-        final_mask = cv2.dilate(body_mask,cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-        contours, _ = cv2.findContours(body_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if contours:
-            largest_contour = max(contours, key=cv2.contourArea)
-            x, y, w, h = cv2.boundingRect(largest_contour)
-            
-            pad = 30
-            x_start, y_start = max(0, x - pad), max(0, y - pad)
-            x_end, y_end = min(original_w, x + w + pad), min(original_h, y + h + pad)
-            
-            cropped_rgb = image_rgb[y_start:y_end, x_start:x_end]
-            crop_h, crop_w = cropped_rgb.shape[:2]
-            
-            if crop_h > 10 and crop_w > 10:
-                augmented = self.transform(image=cropped_rgb)
-                input_tensor = augmented['image'].unsqueeze(0).to(DEVICE)
-                
-                with torch.no_grad():
-                    output = self.model(input_tensor)
-                    prob = torch.sigmoid(output)
-                    pred = (prob > 0.16).float().cpu().numpy()[0, 0]
-                
-                pred_resized = cv2.resize(pred, (crop_w, crop_h), interpolation=cv2.INTER_NEAREST)
-                pred_binary = (pred_resized > 0).astype(np.uint8) * 255
-                
-                roi_mask = np.zeros((original_h, original_w), dtype=np.uint8)
-                roi_mask[y_start:y_end, x_start:x_end] = pred_binary
-                
-                final_mask = cv2.bitwise_and(final_mask, roi_mask)
-                # final_mask = cv2.bitwise_or(final_mask, roi_mask)
-                
-        return final_mask
-
-
     def _get_internal_dark_defects(self, image_rgb, body_mask):
         hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
         v_channel = hsv[:, :, 2]
@@ -163,7 +117,132 @@ class ToothbrushDefectDetector:
         
         return internal_defects
 
-    
+    def _predict_with_tta(self, cropped_rgb):
+        """Dihedral flips + multi-scale ROI TTA; mean fusion and light prob smoothing."""
+        crop_h, crop_w = cropped_rgb.shape[:2]
+        probs = []
+
+        transforms = [
+            (None, lambda x: x),
+            (1, lambda x: cv2.flip(x, 1)),
+            (0, lambda x: cv2.flip(x, 0)),
+            (-1, lambda x: cv2.flip(x, -1)),
+        ]
+
+        for flip_code, inverse_fn in transforms:
+            if flip_code is None:
+                aug_img = cropped_rgb
+            else:
+                aug_img = cv2.flip(cropped_rgb, flip_code)
+
+            for scale in self.roi_tta_scales:
+                sh = max(8, int(round(crop_h * scale)))
+                sw = max(8, int(round(crop_w * scale)))
+                scaled_rgb = cv2.resize(
+                    aug_img, (sw, sh), interpolation=cv2.INTER_LINEAR
+                )
+                augmented = self.transform(image=scaled_rgb)
+                input_tensor = augmented['image'].unsqueeze(0).to(DEVICE)
+
+                with torch.no_grad():
+                    output = self.model(input_tensor)
+                    prob = torch.sigmoid(output).cpu().numpy()[0, 0]
+
+                prob = cv2.resize(
+                    prob.astype(np.float32),
+                    (sw, sh),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                prob = cv2.resize(
+                    prob, (crop_w, crop_h), interpolation=cv2.INTER_LINEAR
+                )
+                probs.append(inverse_fn(prob))
+
+        prob_avg = np.mean(probs, axis=0)
+        return cv2.GaussianBlur(prob_avg, (3, 3), 0)
+
+    def _postprocess_unet_mask(self, mask):
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if num_labels <= 1:
+            return mask
+
+        total_area = mask.shape[0] * mask.shape[1]
+        min_area = max(20, int(total_area * 0.00012))
+        cleaned = np.zeros_like(mask)
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area >= min_area:
+                cleaned[labels == i] = 255
+        return cleaned
+
+    def predict(self, image_rgb):
+        """
+        Main pipeline: Executes classical CV for external defects, 
+        and Deep Learning for internal defects on the ROI.
+        
+        Pipeline:
+        1. Classical CV: detect external splaying + internal dark defects
+        2. U-Net with TTA: detect defects on cropped ROI
+        3. Union all detections, then constrain to body region
+        
+        Args:
+            image_rgb: numpy array of shape (H, W, 3), uint8 RGB image.
+            
+        Returns:
+            Binary mask as numpy array of shape (H, W), uint8 with values 0 or 255.
+        """
+        original_h, original_w = image_rgb.shape[:2]
+        final_mask = np.zeros((original_h, original_w), dtype=np.uint8)
+        
+        # --- Step 1: Classical CV detections ---
+        body_mask = self._get_body_mask(image_rgb)
+        external_defect_mask = self._get_external_defects(body_mask)
+        internal_dark_mask = self._get_internal_dark_defects(image_rgb, body_mask)
+        
+        final_mask = cv2.bitwise_or(final_mask, external_defect_mask)
+        final_mask = cv2.bitwise_or(final_mask, internal_dark_mask)
+        
+        # --- Step 2: U-Net prediction on ROI ---
+        contours, _ = cv2.findContours(body_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            x, y, w, h = cv2.boundingRect(largest_contour)
+            
+            pad = 30
+            x_start, y_start = max(0, x - pad), max(0, y - pad)
+            x_end, y_end = min(original_w, x + w + pad), min(original_h, y + h + pad)
+            
+            cropped_rgb = image_rgb[y_start:y_end, x_start:x_end]
+            crop_h, crop_w = cropped_rgb.shape[:2]
+            
+            if crop_h > 10 and crop_w > 10:
+                # TTA: average predictions from multiple augmented views
+                prob_avg = self._predict_with_tta(cropped_rgb)
+                
+                pred = (prob_avg > self.threshold).astype(np.float32)
+                
+                pred_resized = cv2.resize(pred, (crop_w, crop_h), interpolation=cv2.INTER_NEAREST)
+                pred_binary = (pred_resized > 0).astype(np.uint8) * 255
+                pred_binary = self._postprocess_unet_mask(pred_binary)
+
+                
+                roi_mask = np.zeros((original_h, original_w), dtype=np.uint8)
+                roi_mask[y_start:y_end, x_start:x_end] = pred_binary
+                
+                # UNION: combine U-Net predictions with classical CV detections
+                final_mask = cv2.bitwise_or(final_mask, roi_mask)
+        
+        # --- Step 3: Constrain to body region (remove FPs outside toothbrush) ---
+        body_dilated = cv2.dilate(body_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        final_mask = cv2.bitwise_and(final_mask, body_dilated)
+                
+        return final_mask
 
 
 # Module-level initialization: create the detector once when model.py is imported.
