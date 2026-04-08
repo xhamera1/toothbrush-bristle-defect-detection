@@ -58,6 +58,7 @@ class ToothbrushDefectDetector:
             ToTensorV2()
         ])
 
+    # RGB->HSV, CLAHE, Gausian Blur, Otsu, Canny, OR: maska intensywnosci + krawedzie, mrofologia: close i open
     def _get_body_mask(self, image_rgb):
         hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
         v = hsv[:, :, 2]
@@ -88,6 +89,10 @@ class ToothbrushDefectDetector:
 
         return filled_mask
 
+    # otwarcie na masce ciala -> wykrywa odstajace elementy 
+    # dylatacja rdzenia
+    # deviation = body_mask AND NOT(core_expanded) -> to co jest poza rdzeniem traktujemy jako kandydata defektu zewnetrznego
+    # otwarcie
     def _get_external_defects(self, body_mask):
         """Finds splaying bristles using morphological opening."""
         circular_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -101,6 +106,7 @@ class ToothbrushDefectDetector:
         
         return cv2.morphologyEx(deviation_mask, cv2.MORPH_OPEN, noise_kernel)
 
+    # RGB->HSV, Otsu na V-kanale, Binary Inverse, Erosion, AND z ciemnymi pikselami, otwarcie -> OTRZYMUJEMY MASKE CIEMNYCH DEFEKTOW WEWNETRZNYCH
     def _get_internal_dark_defects(self, image_rgb, body_mask):
         hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
         v_channel = hsv[:, :, 2]
@@ -119,6 +125,7 @@ class ToothbrushDefectDetector:
         
         return internal_defects
 
+    # TTA - Test Time Augmentation - pokazujemy kilka wersji jednego obrazka, np odbicie lustrzane, odbicie w poziomie itp, i bierzemy z tego średnią
     def _predict_with_tta(self, cropped_rgb):
         """Dihedral flips + multi-scale ROI TTA; mean fusion and light prob smoothing."""
         crop_h, crop_w = cropped_rgb.shape[:2]
@@ -163,6 +170,7 @@ class ToothbrushDefectDetector:
         prob_avg = np.mean(probs, axis=0)
         return cv2.GaussianBlur(prob_avg, (3, 3), 0)
 
+    # otwarcie i zamkniecie maski U-Net - usuwa małe artefakty i zle powstale obiekty
     def _postprocess_unet_mask(self, mask):
         close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -201,10 +209,10 @@ class ToothbrushDefectDetector:
         original_h, original_w = image_rgb.shape[:2]
         final_mask = np.zeros((original_h, original_w), dtype=np.uint8)
         
-        # --- Step 1: Classical CV detections ---
-        body_mask = self._get_body_mask(image_rgb)
-        external_defect_mask = self._get_external_defects(body_mask)
-        internal_dark_mask = self._get_internal_dark_defects(image_rgb, body_mask)
+
+        body_mask = self._get_body_mask(image_rgb) # HSV + CLAHE + Otsu + Canny + Morphology + Connected Components
+        external_defect_mask = self._get_external_defects(body_mask) # morfologia na masce ciala -> wykrywa odstajace elementy 
+        internal_dark_mask = self._get_internal_dark_defects(image_rgb, body_mask)# wykrycie ciemnych defektow wewnetrznych
 
         final_mask = cv2.bitwise_or(final_mask, external_defect_mask)
         final_mask = cv2.bitwise_or(final_mask, internal_dark_mask)
@@ -224,13 +232,13 @@ class ToothbrushDefectDetector:
             crop_h, crop_w = cropped_rgb.shape[:2]
             
             if crop_h > 10 and crop_w > 10:
-                # TTA: average predictions from multiple augmented views
+                # TTA - Test Time Augmentation - pokazujemy kilka wersji jednego obrazka, np odbicie lustrzane, odbicie w poziomie itp, i bierzemy z tego średnią
                 prob_avg = self._predict_with_tta(cropped_rgb)
 
                 pred = (prob_avg > self.threshold).astype(np.float32)
                 pred_resized = cv2.resize(pred, (crop_w, crop_h), interpolation=cv2.INTER_NEAREST)
                 pred_binary = (pred_resized > 0).astype(np.uint8) * 255
-                pred_binary = self._postprocess_unet_mask(pred_binary)
+                pred_binary = self._postprocess_unet_mask(pred_binary) # otwarcie i zamkniecie maski U-Net - usuwa małe artefakty i zle powstale obiekty
 
                 roi_mask = np.zeros((original_h, original_w), dtype=np.uint8)
                 roi_mask[y_start:y_end, x_start:x_end] = pred_binary
